@@ -43,6 +43,8 @@ class DataConfig:
     image_dir: Optional[str] = None
     video_fps: float = 2.0
     max_prompt_length: int = 512
+    max_teacher_prompt_length: Optional[int] = None
+    build_opsd_teacher: bool = False
     max_response_length: int = 512
     rollout_batch_size: int = 512
     mini_rollout_batch_size: Optional[int] = None
@@ -70,6 +72,8 @@ class AlgorithmConfig:
     """lambda value for ppo gae advantage estimator"""
     adv_estimator: str = "grpo"
     """advantage estimator, support `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`"""
+    objective: str = "rl"
+    """training objective, support `rl` and `opsd`"""
     disable_kl: bool = False
     """disable reference model"""
     use_kl_loss: bool = False
@@ -153,6 +157,15 @@ class PPOConfig:
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
 
     def post_init(self):
+        if self.algorithm.objective not in ("rl", "opsd"):
+            raise ValueError(f"Unknown objective: {self.algorithm.objective}.")
+
+        if self.algorithm.objective == "opsd":
+            self.algorithm.disable_kl = True
+            self.algorithm.use_kl_loss = False
+            self.worker.actor.loss_type = "opsd"
+            self.data.build_opsd_teacher = True
+
         self.worker.rollout.prompt_length = self.data.max_prompt_length
         self.worker.rollout.response_length = self.data.max_response_length
         self.worker.rollout.trust_remote_code = self.worker.actor.model.trust_remote_code

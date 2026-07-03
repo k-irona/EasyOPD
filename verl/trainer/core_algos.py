@@ -509,6 +509,82 @@ def compute_policy_loss(
     return final_pg_loss, metrics
 
 
+def compute_opsd_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+    divergence: Literal["forward_kl", "teacher_topk_ce"],
+    top_k: int,
+    temperature: float,
+    kl_clip: float,
+    loss_avg_mode: Literal["token", "seq"],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute OPSD token-level distillation loss.
+
+    `forward_kl` computes KL(p_teacher || p_student) over the full vocabulary.
+    `teacher_topk_ce` computes cross entropy on the teacher top-k conditional distribution and logs the original
+    teacher probability mass covered by top-k. It is not an exact KL and avoids full-vocabulary log-softmax.
+    `kl_clip` is only used as a reporting threshold for clip_fraction and does not clip optimization gradients.
+    """
+    if temperature <= 0:
+        raise ValueError(f"OPSD temperature must be positive, got {temperature}.")
+
+    if divergence == "forward_kl":
+        student_logp = F.log_softmax(student_logits.float() / temperature, dim=-1)
+        with torch.no_grad():
+            teacher_logp = F.log_softmax(teacher_logits.float() / temperature, dim=-1)
+            teacher_p = teacher_logp.exp()
+
+        teacher_entropy = -(teacher_p * teacher_logp).sum(dim=-1)
+        student_p = student_logp.exp()
+        student_entropy = -(student_p * student_logp).sum(dim=-1)
+        token_loss = (teacher_p * (teacher_logp - student_logp)).sum(dim=-1)
+        topk_mass = torch.ones_like(token_loss)
+    elif divergence == "teacher_topk_ce":
+        vocab_size = teacher_logits.size(-1)
+        if top_k <= 0 or top_k >= vocab_size:
+            top_teacher_logits = teacher_logits
+            top_idx = torch.arange(vocab_size, device=teacher_logits.device).view(1, 1, -1).expand_as(teacher_logits)
+        else:
+            top_teacher_logits, top_idx = torch.topk(teacher_logits, k=top_k, dim=-1)
+
+        top_teacher_logits = top_teacher_logits.float() / temperature
+        top_teacher_logp = F.log_softmax(top_teacher_logits, dim=-1)
+        top_teacher_p = top_teacher_logp.exp()
+
+        scaled_student_logits = student_logits.float() / temperature
+        student_log_norm = torch.logsumexp(scaled_student_logits, dim=-1, keepdim=True)
+        top_student_logits = torch.gather(scaled_student_logits, dim=-1, index=top_idx)
+        top_student_logp = top_student_logits - student_log_norm
+        token_loss = -(top_teacher_p * top_student_logp).sum(dim=-1)
+
+        with torch.no_grad():
+            teacher_log_norm = torch.logsumexp(teacher_logits.float() / temperature, dim=-1)
+            top_teacher_log_norm = torch.logsumexp(top_teacher_logits, dim=-1)
+            topk_mass = torch.exp(top_teacher_log_norm - teacher_log_norm)
+            teacher_entropy = -(top_teacher_p * top_teacher_logp).sum(dim=-1)
+            top_student_cond_logp = F.log_softmax(top_student_logits, dim=-1)
+            top_student_cond_p = top_student_cond_logp.exp()
+            student_entropy = -(top_student_cond_p * top_student_cond_logp).sum(dim=-1)
+    else:
+        raise NotImplementedError(f"Unknown OPSD divergence: {divergence}.")
+
+    if kl_clip > 0:
+        clip_fraction = ((token_loss > kl_clip).float() * response_mask).sum() / (response_mask.sum() + 1e-8)
+    else:
+        clip_fraction = torch.zeros((), device=token_loss.device)
+
+    loss = average_loss(token_loss, response_mask, mode=loss_avg_mode)
+    metrics = {
+        "loss": loss.detach().item(),
+        "clip_fraction": clip_fraction.detach().item(),
+        "teacher_entropy": VF.masked_mean(teacher_entropy, response_mask).detach().item(),
+        "student_entropy": VF.masked_mean(student_entropy, response_mask).detach().item(),
+        "topk_mass": VF.masked_mean(topk_mass, response_mask).detach().item(),
+    }
+    return loss, metrics
+
+
 def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,

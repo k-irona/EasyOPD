@@ -27,7 +27,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
+from ...trainer.core_algos import average_loss, compute_kl, compute_opsd_loss, compute_policy_loss
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
 from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -140,19 +140,70 @@ class DataParallelPPOActor(BasePPOActor):
             )
             log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
         else:
-            output = self.actor_module(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **multi_modal_inputs,
-                use_cache=False,
-            )
-            logits: torch.Tensor = output.logits
-            logits.div_(temperature)
-            logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+            logits = self._forward_micro_batch_logits(micro_batch, temperature=temperature)
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
 
         return log_probs
+
+    def _forward_micro_batch_logits(
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        input_ids_key: str = "input_ids",
+        attention_mask_key: str = "attention_mask",
+        position_ids_key: str = "position_ids",
+    ) -> torch.Tensor:
+        input_ids = micro_batch[input_ids_key]
+        attention_mask = micro_batch[attention_mask_key]
+        position_ids = micro_batch[position_ids_key]
+        responses = micro_batch["responses"]
+        response_length = responses.size(-1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+
+        multi_modal_inputs = defaultdict(list)
+        if "multi_modal_inputs" in micro_batch:
+            multi_modal_inputs = batch_collate(micro_batch["multi_modal_inputs"])
+            multi_modal_inputs = {key: torch.cat(value, dim=0) for key, value in multi_modal_inputs.items()}
+        else:
+            multi_modal_inputs = {}
+
+        output = self.actor_module(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **multi_modal_inputs,
+            use_cache=False,
+        )
+        logits: torch.Tensor = output.logits
+        logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+        return logits / temperature
+
+    def _build_teacher_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        teacher_prompts = micro_batch["teacher_prompts"]
+        teacher_attention_mask = micro_batch["teacher_attention_mask"]
+        teacher_position_ids = micro_batch["teacher_position_ids"]
+        responses = micro_batch["responses"]
+        response_mask = micro_batch["response_mask"]
+        batch_size, response_length = responses.shape
+
+        delta_position_id = torch.arange(
+            1, response_length + 1, device=teacher_position_ids.device, dtype=teacher_position_ids.dtype
+        )
+        delta_position_id = delta_position_id.view(1, -1).expand(batch_size, -1)
+        if teacher_position_ids.ndim == 3:  # qwen2vl mrope: (batch_size, 4, seq_length)
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(
+                batch_size, teacher_position_ids.size(1), -1
+            )
+
+        teacher_response_position_ids = teacher_position_ids[..., -1:] + delta_position_id
+        teacher_batch = dict(micro_batch)
+        teacher_batch["teacher_input_ids"] = torch.cat([teacher_prompts, responses], dim=-1)
+        teacher_batch["teacher_full_attention_mask"] = torch.cat([teacher_attention_mask, response_mask], dim=-1)
+        teacher_batch["teacher_full_position_ids"] = torch.cat(
+            [teacher_position_ids, teacher_response_position_ids], dim=-1
+        )
+        return teacher_batch
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
@@ -221,7 +272,10 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
-        select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
+        if self.config.loss_type == "opsd":
+            select_keys.extend(["teacher_prompts", "teacher_attention_mask", "teacher_position_ids"])
+        else:
+            select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -239,6 +293,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if self.config.dynamic_batching:
                     max_input_len = mini_batch.batch["input_ids"].size(-1)
+                    if self.config.loss_type == "opsd":
+                        max_input_len = max(
+                            max_input_len,
+                            mini_batch.batch["teacher_prompts"].size(-1) + mini_batch.batch["responses"].size(-1),
+                        )
+
                     max_token_len = self.config.micro_batch_size_per_device_for_update * max_input_len
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
@@ -250,45 +310,75 @@ class DataParallelPPOActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_probs = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
+                    if self.config.loss_type == "opsd":
+                        teacher_inputs = self._build_teacher_micro_batch(model_inputs)
+                        was_training = self.actor_module.training
+                        self.actor_module.eval()
+                        with torch.no_grad():
+                            teacher_logits = self._forward_micro_batch_logits(
+                                teacher_inputs,
+                                temperature=1.0,
+                                input_ids_key="teacher_input_ids",
+                                attention_mask_key="teacher_full_attention_mask",
+                                position_ids_key="teacher_full_position_ids",
+                            ).detach()
 
-                    # all return: (bsz, response_length)
-                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                        if was_training:
+                            self.actor_module.train()
 
-                    pg_loss, pg_metrics = compute_policy_loss(
-                        old_log_probs=old_log_probs,
-                        log_probs=log_probs,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        clip_ratio_low=self.config.clip_ratio_low,
-                        clip_ratio_high=self.config.clip_ratio_high,
-                        clip_ratio_dual=self.config.clip_ratio_dual,
-                        tau_positive=self.config.tau_positive,
-                        tau_negative=self.config.tau_negative,
-                        loss_type=self.config.loss_type,
-                        loss_avg_mode=self.config.loss_avg_mode,
-                    )
-                    if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
-                        ref_log_probs = model_inputs["ref_log_probs"]
-                        # compute kl loss
-                        kld = compute_kl(
-                            log_probs=log_probs,
-                            ref_log_probs=ref_log_probs,
-                            kl_penalty=self.config.kl_penalty,
+                        student_logits = self._forward_micro_batch_logits(model_inputs, temperature=1.0)
+                        loss, opsd_metrics = compute_opsd_loss(
+                            student_logits=student_logits,
+                            teacher_logits=teacher_logits,
+                            response_mask=response_mask,
+                            divergence=self.config.opsd_divergence,
+                            top_k=self.config.opsd_top_k,
+                            temperature=self.config.opsd_temperature,
+                            kl_clip=self.config.opsd_kl_clip,
+                            loss_avg_mode=self.config.loss_avg_mode,
                         )
-                        kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
-                        loss = pg_loss + kl_loss * self.config.kl_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_coef
+                        batch_metrics = {f"opsd/{k}": v for k, v in opsd_metrics.items()}
                     else:
-                        loss = pg_loss
+                        old_log_probs = model_inputs["old_log_probs"]
+                        advantages = model_inputs["advantages"]
+
+                        # all return: (bsz, response_length)
+                        log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+
+                        pg_loss, pg_metrics = compute_policy_loss(
+                            old_log_probs=old_log_probs,
+                            log_probs=log_probs,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            clip_ratio_low=self.config.clip_ratio_low,
+                            clip_ratio_high=self.config.clip_ratio_high,
+                            clip_ratio_dual=self.config.clip_ratio_dual,
+                            tau_positive=self.config.tau_positive,
+                            tau_negative=self.config.tau_negative,
+                            loss_type=self.config.loss_type,
+                            loss_avg_mode=self.config.loss_avg_mode,
+                        )
+                        if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
+                            ref_log_probs = model_inputs["ref_log_probs"]
+                            # compute kl loss
+                            kld = compute_kl(
+                                log_probs=log_probs,
+                                ref_log_probs=ref_log_probs,
+                                kl_penalty=self.config.kl_penalty,
+                            )
+                            kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
+                            loss = pg_loss + kl_loss * self.config.kl_coef
+                            metrics["actor/kl_loss"] = kl_loss.detach().item()
+                            metrics["actor/kl_coef"] = self.config.kl_coef
+                        else:
+                            loss = pg_loss
+
+                        batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
+                        batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
 
                     loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
                     loss.backward()
 
-                    batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
-                    batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
                     append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()

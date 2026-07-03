@@ -191,8 +191,10 @@ class RayPPOTrainer:
         self.use_reward_model = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
 
+        self.is_opsd = config.algorithm.objective == "opsd"
+
         # define KL control
-        if config.algorithm.disable_kl:
+        if self.is_opsd or config.algorithm.disable_kl:
             self.use_reference_policy = False
             self.kl_ctrl = FixedKLController(init_kl_coef=0.0)
             print("KL is disabled, no KL metrics will be logged. Please set `kl_coef=0` to log KL metrics.")
@@ -200,12 +202,14 @@ class RayPPOTrainer:
             self.use_reference_policy = True
             self.kl_ctrl = get_kl_controller(config.algorithm)
 
-        if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if self.is_opsd:
+            self.use_critic = False
+        elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         else:
             self.use_critic = False
 
-        if config.algorithm.adv_estimator not in list(AdvantageEstimator):
+        if not self.is_opsd and config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
         if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
@@ -230,7 +234,8 @@ class RayPPOTrainer:
                 )
 
         if (
-            config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
+            not self.is_opsd
+            and config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
             and config.worker.rollout.n == 1
         ):
             raise ValueError("GRPO and RLOO algorithm need `config.worker.rollout.n > 1`.")
@@ -496,7 +501,7 @@ class RayPPOTrainer:
             # generate a batch
             gen_batch_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
 
-            if self.config.algorithm.adv_estimator == "remax":
+            if not self.is_opsd and self.config.algorithm.adv_estimator == "remax":
                 gen_baseline_batch = deepcopy(gen_batch)
                 gen_baseline_batch.meta_info["temperature"] = 0
                 gen_baseline_batch.meta_info["n"] = 1
@@ -515,7 +520,7 @@ class RayPPOTrainer:
             new_batch = new_batch.union(gen_batch_output)
 
             # filter group
-            if self.config.algorithm.online_filtering:
+            if not self.is_opsd and self.config.algorithm.online_filtering:
                 reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(new_batch))
                 new_batch.batch["token_level_scores"] = reward_tensor
                 for k, v in reward_metrics.items():
@@ -553,7 +558,7 @@ class RayPPOTrainer:
                     )
             else:
                 print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
-                if self.config.algorithm.online_filtering:
+                if not self.is_opsd and self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
 
                 return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
@@ -600,68 +605,76 @@ class RayPPOTrainer:
 
                 # compute global valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                batch.meta_info["temperature"] = self.config.worker.rollout.temperature
 
-                # compute reward
-                if "token_level_scores" not in batch.batch:
-                    with timer("reward", timing_raw):
-                        reward_ref = self.reward_fn.compute_reward.remote(batch)
-
-                # recompute old_log_probs
-                with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
-
-                # compute ref_log_probs
-                if self.use_reference_policy:
-                    with timer("ref", timing_raw):
-                        ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
-                        batch = batch.union(ref_log_probs)
-
-                # compute values
-                if self.use_critic:
-                    with timer("values", timing_raw):
-                        values = self.critic_wg.compute_values(batch)
-                        batch = batch.union(values)
-
-                with timer("adv", timing_raw):
-                    if "token_level_scores" not in batch.batch:
-                        # get token level scores asynchronously
-                        reward_tensor, reward_metrics = ray.get(reward_ref)
-                        batch.batch["token_level_scores"] = reward_tensor
-                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
-                        metrics.update(reward_metrics)
-
-                    # apply kl penalty if available
-                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
-                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
-                        metrics.update(kl_metrics)
-                    else:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
-
-                # update critic
-                if self.use_critic:
-                    with timer("update_critic", timing_raw):
-                        critic_output = self.critic_wg.update_critic(batch)
-
-                    critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
-                    metrics.update(critic_metrics)
-
-                # update actor
-                if self.config.trainer.critic_warmup <= self.global_step:
+                if self.is_opsd:
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
+                else:
+                    # compute reward
+                    if "token_level_scores" not in batch.batch:
+                        with timer("reward", timing_raw):
+                            reward_ref = self.reward_fn.compute_reward.remote(batch)
+
+                    # recompute old_log_probs
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
+
+                    # compute ref_log_probs
+                    if self.use_reference_policy:
+                        with timer("ref", timing_raw):
+                            ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
+                            batch = batch.union(ref_log_probs)
+
+                    # compute values
+                    if self.use_critic:
+                        with timer("values", timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
+
+                    with timer("adv", timing_raw):
+                        if "token_level_scores" not in batch.batch:
+                            # get token level scores asynchronously
+                            reward_tensor, reward_metrics = ray.get(reward_ref)
+                            batch.batch["token_level_scores"] = reward_tensor
+                            reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                            metrics.update(reward_metrics)
+
+                        # apply kl penalty if available
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            # apply kl penalty to reward
+                            batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
+
+                    # update critic
+                    if self.use_critic:
+                        with timer("update_critic", timing_raw):
+                            critic_output = self.critic_wg.update_critic(batch)
+
+                        critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
+                        metrics.update(critic_metrics)
+
+                    # update actor
+                    if self.config.trainer.critic_warmup <= self.global_step:
+                        with timer("update_actor", timing_raw):
+                            actor_output = self.actor_rollout_ref_wg.update_actor(batch)
+
+                        actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
+                        metrics.update(actor_metrics)
 
                 # validate
                 if (
@@ -680,7 +693,10 @@ class RayPPOTrainer:
 
             # collect metrics
             num_gpus = self.resource_pool_manager.get_num_gpus()
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            if self.is_opsd:
+                metrics.update(compute_length_metrics(batch))
+            else:
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 

@@ -113,7 +113,7 @@ class ActorConfig:
     loss_avg_mode: str = "token"
     """loss average mode: `token`, `seq`"""
     loss_type: str = "default"
-    """loss type: `default`, `gspo`, `cispo`"""
+    """loss type: `default`, `gspo`, `cispo`, `opsd`"""
     ppo_epochs: int = 1
     """number of ppo epochs for each rollout batch"""
     padding_free: bool = True
@@ -128,6 +128,14 @@ class ActorConfig:
     """temperature for positive tokens"""
     tau_negative: float = 1.05
     """temperature for negative tokens"""
+    opsd_divergence: str = "teacher_topk_ce"
+    """OPSD loss type: `teacher_topk_ce` or `forward_kl`"""
+    opsd_top_k: int = 64
+    """top-k teacher tokens for teacher-top-k cross entropy; <= 0 uses full vocabulary"""
+    opsd_temperature: float = 1.0
+    """temperature used to form OPSD teacher/student distributions"""
+    opsd_kl_clip: float = 0.0
+    """threshold for reporting OPSD clip fraction; <= 0 disables the metric"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
