@@ -290,6 +290,8 @@ class DataParallelPPOActor(BasePPOActor):
             for mini_batch in mini_batches:
                 total_response_tokens = torch.sum(mini_batch.batch["response_mask"])
                 dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
+                if total_response_tokens <= 0:
+                    continue
 
                 if self.config.dynamic_batching:
                     max_input_len = mini_batch.batch["input_ids"].size(-1)

@@ -501,6 +501,16 @@ class RayPPOTrainer:
         if kept == 0:
             return batch[:0]
 
+        if not self.config.worker.actor.opsd_format_filter_refill:
+            keep_mask = torch.zeros(total, dtype=torch.bool, device=batch.batch["response_mask"].device)
+            keep_mask[kept_idxs] = True
+            batch.batch["response_mask"] = batch.batch["response_mask"] * keep_mask.unsqueeze(-1).to(
+                batch.batch["response_mask"].dtype
+            )
+            metrics.setdefault("opsd_format_filter/masked", 0)
+            metrics["opsd_format_filter/masked"] += total - kept
+            return batch
+
         return batch[kept_idxs]
 
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:

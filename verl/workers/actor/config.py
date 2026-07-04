@@ -138,6 +138,8 @@ class ActorConfig:
     """threshold for reporting OPSD clip fraction; <= 0 disables the metric"""
     opsd_format_filter: str = "none"
     """drop OPSD rollout samples with invalid response format: `none`, `r1v`, or `math`"""
+    opsd_format_filter_refill: bool = True
+    """keep generating after OPSD format filtering until rollout_batch_size valid samples are collected"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
