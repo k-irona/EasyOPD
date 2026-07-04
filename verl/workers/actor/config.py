@@ -136,6 +136,8 @@ class ActorConfig:
     """temperature used to form OPSD teacher/student distributions"""
     opsd_kl_clip: float = 0.0
     """threshold for reporting OPSD clip fraction; <= 0 disables the metric"""
+    opsd_format_filter: str = "none"
+    """drop OPSD rollout samples with invalid response format: `none`, `r1v`, or `math`"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)

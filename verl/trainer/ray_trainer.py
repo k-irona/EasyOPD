@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface.
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -468,6 +469,40 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _filter_opsd_format(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        filter_mode = self.config.worker.actor.opsd_format_filter
+        if filter_mode == "none":
+            return batch
+
+        if filter_mode == "r1v":
+            pattern = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.DOTALL)
+        elif filter_mode == "math":
+            pattern = re.compile(r"<think>.*</think>.*\\boxed\{.*\}.*", re.DOTALL)
+        else:
+            raise ValueError(f"Unknown OPSD format filter: {filter_mode}. Expected `none`, `r1v`, or `math`.")
+
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"].bool()
+        kept_idxs = []
+        for idx, (response_ids, mask) in enumerate(zip(responses, response_mask)):
+            valid_ids = response_ids[mask].tolist()
+            response_text = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
+            if re.fullmatch(pattern, response_text):
+                kept_idxs.append(idx)
+
+        total = len(batch)
+        kept = len(kept_idxs)
+        metrics.setdefault("opsd_format_filter/total", 0)
+        metrics.setdefault("opsd_format_filter/kept", 0)
+        metrics["opsd_format_filter/total"] += total
+        metrics["opsd_format_filter/kept"] += kept
+        print(f"OPSD format filter `{filter_mode}` kept {kept}/{total} rollout samples.")
+
+        if kept == 0:
+            return batch[:0]
+
+        return batch[kept_idxs]
+
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -519,6 +554,18 @@ class RayPPOTrainer:
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
             new_batch = new_batch.union(gen_batch_output)
 
+            if self.is_opsd:
+                new_batch = self._filter_opsd_format(new_batch, metrics)
+                if len(new_batch) == 0:
+                    max_try_make_batch = self.config.trainer.max_try_make_batch
+                    if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
+                        print(f"{num_try_make_batch=}. No OPSD sample kept after format filtering. Continue generating...")
+                        continue
+                    raise RuntimeError(
+                        f"{num_try_make_batch=} >= {max_try_make_batch=}. "
+                        "No OPSD sample is kept after format filtering. Please check the prompt or filter mode."
+                    )
+
             # filter group
             if not self.is_opsd and self.config.algorithm.online_filtering:
                 reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(new_batch))
@@ -560,6 +607,10 @@ class RayPPOTrainer:
                 print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                 if not self.is_opsd and self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
+                if self.is_opsd and metrics.get("opsd_format_filter/total", 0) > 0:
+                    total = metrics["opsd_format_filter/total"]
+                    kept = metrics["opsd_format_filter/kept"]
+                    metrics["opsd_format_filter/keep_ratio"] = kept / total
 
                 return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
 

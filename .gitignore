@@ -182,3 +182,7 @@ tensorboard_log/
 # data
 images/
 images*
+
+# local handoff notes
+docs/
+result/
