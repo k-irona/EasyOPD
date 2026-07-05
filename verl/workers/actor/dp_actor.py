@@ -368,8 +368,8 @@ class DataParallelPPOActor(BasePPOActor):
                             reward_advantages = model_inputs["opsd_reward_advantages"].to(log_probs.dtype).unsqueeze(-1)
                             reward_pg_loss = average_loss(
                                 -reward_advantages * log_probs,
-                                response_mask=response_mask,
-                                loss_avg_mode=self.config.loss_avg_mode,
+                                response_mask,
+                                mode=self.config.loss_avg_mode,
                             )
                             loss = loss + self.config.opsd_reward_pg_loss_coef * reward_pg_loss
                             batch_metrics["opsd/reward_pg_loss"] = reward_pg_loss.detach().item()
