@@ -277,7 +277,7 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.opsd_format_pg != "none" and self.config.opsd_format_pg_loss_coef > 0:
                 select_keys.append("format_advantages")
             if self.config.opsd_reward_pg != "none" and self.config.opsd_reward_pg_loss_coef > 0:
-                select_keys.extend(["old_log_probs", "opsd_reward_advantages"])
+                select_keys.append("opsd_reward_advantages")
         else:
             select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
@@ -361,28 +361,22 @@ class DataParallelPPOActor(BasePPOActor):
                             ).detach().item()
                         if (
                             self.config.opsd_reward_pg_loss_coef > 0
-                            and "old_log_probs" in model_inputs
                             and "opsd_reward_advantages" in model_inputs
                         ):
                             if log_probs is None:
                                 log_probs = self.log_probs_from_logits(student_logits, model_inputs["responses"])
-                            reward_pg_loss, reward_pg_metrics = compute_policy_loss(
-                                old_log_probs=model_inputs["old_log_probs"],
-                                log_probs=log_probs,
-                                advantages=model_inputs["opsd_reward_advantages"],
+                            reward_advantages = model_inputs["opsd_reward_advantages"].to(log_probs.dtype).unsqueeze(-1)
+                            reward_pg_loss = average_loss(
+                                -reward_advantages * log_probs,
                                 response_mask=response_mask,
-                                clip_ratio_low=self.config.clip_ratio_low,
-                                clip_ratio_high=self.config.clip_ratio_high,
-                                clip_ratio_dual=self.config.clip_ratio_dual,
-                                tau_positive=self.config.tau_positive,
-                                tau_negative=self.config.tau_negative,
-                                loss_type="default",
                                 loss_avg_mode=self.config.loss_avg_mode,
                             )
                             loss = loss + self.config.opsd_reward_pg_loss_coef * reward_pg_loss
-                            batch_metrics.update({f"opsd/reward_{k}": v for k, v in reward_pg_metrics.items()})
                             batch_metrics["opsd/reward_pg_loss"] = reward_pg_loss.detach().item()
                             batch_metrics["opsd/reward_pg_loss_coef"] = self.config.opsd_reward_pg_loss_coef
+                            batch_metrics["opsd/reward_advantage"] = (
+                                (reward_advantages * response_mask).sum() / (response_mask.sum() + 1e-8)
+                            ).detach().item()
                     else:
                         old_log_probs = model_inputs["old_log_probs"]
                         advantages = model_inputs["advantages"]

@@ -557,12 +557,9 @@ class RayPPOTrainer:
         metrics.update(reward_metrics)
 
         scores = reward_tensor.sum(dim=-1)
-        if scores.numel() > 1:
-            advantages = (scores - scores.mean()) / (scores.std(unbiased=False) + 1e-6)
-        else:
-            advantages = scores - scores.mean()
+        advantages = scores * 2.0 - 1.0
 
-        batch.batch["opsd_reward_advantages"] = advantages.unsqueeze(-1) * batch.batch["response_mask"]
+        batch.batch["opsd_reward_advantages"] = advantages
         metrics["opsd_reward_pg/advantage_mean"] = advantages.mean().item()
         metrics["opsd_reward_pg/advantage_min"] = advantages.min().item()
         metrics["opsd_reward_pg/advantage_max"] = advantages.max().item()
@@ -727,14 +724,6 @@ class RayPPOTrainer:
                 batch.meta_info["temperature"] = self.config.worker.rollout.temperature
 
                 if self.is_opsd:
-                    if (
-                        self.config.worker.actor.opsd_reward_pg != "none"
-                        and self.config.worker.actor.opsd_reward_pg_loss_coef > 0
-                    ):
-                        with timer("old", timing_raw):
-                            old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                            batch = batch.union(old_log_probs)
-
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 
