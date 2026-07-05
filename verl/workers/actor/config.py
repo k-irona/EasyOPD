@@ -144,6 +144,10 @@ class ActorConfig:
     """add an OPSD format-only policy-gradient loss: `none`, `r1v`, or `math`"""
     opsd_format_pg_loss_coef: float = 0.0
     """coefficient for the OPSD format-only policy-gradient loss"""
+    opsd_reward_pg: str = "none"
+    """add an OPSD reward policy-gradient loss: `none` or `overall`"""
+    opsd_reward_pg_loss_coef: float = 0.0
+    """coefficient for the OPSD reward policy-gradient loss"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)

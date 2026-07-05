@@ -542,6 +542,33 @@ class RayPPOTrainer:
         print(f"OPSD format PG `{format_mode}` reward mean {reward_tensor.mean().item():.4f}.")
         return batch
 
+    def _add_opsd_reward_pg(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        reward_mode = self.config.worker.actor.opsd_reward_pg
+        if reward_mode == "none" or self.config.worker.actor.opsd_reward_pg_loss_coef <= 0:
+            return batch
+        if reward_mode != "overall":
+            raise ValueError(f"Unknown OPSD reward PG mode: {reward_mode}. Expected `none` or `overall`.")
+        if self.reward_fn is None:
+            raise RuntimeError("OPSD reward PG requires worker.reward.reward_function to be configured.")
+
+        reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(batch))
+        batch.batch["token_level_scores"] = reward_tensor
+        reward_metrics = {f"opsd_reward_pg/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+        metrics.update(reward_metrics)
+
+        scores = reward_tensor.sum(dim=-1)
+        if scores.numel() > 1:
+            advantages = (scores - scores.mean()) / (scores.std(unbiased=False) + 1e-6)
+        else:
+            advantages = scores - scores.mean()
+
+        batch.batch["opsd_reward_advantages"] = advantages.unsqueeze(-1) * batch.batch["response_mask"]
+        metrics["opsd_reward_pg/advantage_mean"] = advantages.mean().item()
+        metrics["opsd_reward_pg/advantage_min"] = advantages.min().item()
+        metrics["opsd_reward_pg/advantage_max"] = advantages.max().item()
+        print(f"OPSD reward PG `{reward_mode}` reward mean {scores.mean().item():.4f}.")
+        return batch
+
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -595,6 +622,7 @@ class RayPPOTrainer:
 
             if self.is_opsd:
                 new_batch = self._add_opsd_format_pg(new_batch, metrics)
+                new_batch = self._add_opsd_reward_pg(new_batch, metrics)
                 new_batch = self._filter_opsd_format(new_batch, metrics)
                 if len(new_batch) == 0:
                     max_try_make_batch = self.config.trainer.max_try_make_batch
@@ -699,6 +727,14 @@ class RayPPOTrainer:
                 batch.meta_info["temperature"] = self.config.worker.rollout.temperature
 
                 if self.is_opsd:
+                    if (
+                        self.config.worker.actor.opsd_reward_pg != "none"
+                        and self.config.worker.actor.opsd_reward_pg_loss_coef > 0
+                    ):
+                        with timer("old", timing_raw):
+                            old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                            batch = batch.union(old_log_probs)
+
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 
