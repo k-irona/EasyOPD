@@ -274,6 +274,8 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         if self.config.loss_type == "opsd":
             select_keys.extend(["teacher_prompts", "teacher_attention_mask", "teacher_position_ids"])
+            if self.config.opsd_format_pg != "none" and self.config.opsd_format_pg_loss_coef > 0:
+                select_keys.append("format_advantages")
         else:
             select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
@@ -340,6 +342,20 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_avg_mode=self.config.loss_avg_mode,
                         )
                         batch_metrics = {f"opsd/{k}": v for k, v in opsd_metrics.items()}
+                        if self.config.opsd_format_pg_loss_coef > 0 and "format_advantages" in model_inputs:
+                            log_probs = self.log_probs_from_logits(student_logits, model_inputs["responses"])
+                            format_advantages = model_inputs["format_advantages"].to(log_probs.dtype).unsqueeze(-1)
+                            format_pg_loss = average_loss(
+                                -format_advantages * log_probs,
+                                response_mask,
+                                mode=self.config.loss_avg_mode,
+                            )
+                            loss = loss + self.config.opsd_format_pg_loss_coef * format_pg_loss
+                            batch_metrics["opsd/format_pg_loss"] = format_pg_loss.detach().item()
+                            batch_metrics["opsd/format_pg_loss_coef"] = self.config.opsd_format_pg_loss_coef
+                            batch_metrics["opsd/format_advantage"] = (
+                                (format_advantages * response_mask).sum() / (response_mask.sum() + 1e-8)
+                            ).detach().item()
                     else:
                         old_log_probs = model_inputs["old_log_probs"]
                         advantages = model_inputs["advantages"]

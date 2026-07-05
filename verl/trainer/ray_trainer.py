@@ -513,6 +513,35 @@ class RayPPOTrainer:
 
         return batch[kept_idxs]
 
+    def _add_opsd_format_pg(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        format_mode = self.config.worker.actor.opsd_format_pg
+        if format_mode == "none" or self.config.worker.actor.opsd_format_pg_loss_coef <= 0:
+            return batch
+
+        if format_mode == "r1v":
+            pattern = re.compile(r"<think>.*?</think>\s*<answer>.*?</answer>", re.DOTALL)
+        elif format_mode == "math":
+            pattern = re.compile(r"<think>.*</think>.*\\boxed\{.*\}.*", re.DOTALL)
+        else:
+            raise ValueError(f"Unknown OPSD format PG mode: {format_mode}. Expected `none`, `r1v`, or `math`.")
+
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"].bool()
+        rewards = []
+        for response_ids, mask in zip(responses, response_mask):
+            valid_ids = response_ids[mask].tolist()
+            response_text = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
+            rewards.append(1.0 if re.fullmatch(pattern, response_text) else 0.0)
+
+        reward_tensor = torch.tensor(rewards, dtype=torch.float32, device=responses.device)
+        batch.batch["format_advantages"] = reward_tensor * 2.0 - 1.0
+
+        metrics["opsd_format_pg/reward_mean"] = reward_tensor.mean().item()
+        metrics["opsd_format_pg/reward_min"] = reward_tensor.min().item()
+        metrics["opsd_format_pg/reward_max"] = reward_tensor.max().item()
+        print(f"OPSD format PG `{format_mode}` reward mean {reward_tensor.mean().item():.4f}.")
+        return batch
+
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -565,6 +594,7 @@ class RayPPOTrainer:
             new_batch = new_batch.union(gen_batch_output)
 
             if self.is_opsd:
+                new_batch = self._add_opsd_format_pg(new_batch, metrics)
                 new_batch = self._filter_opsd_format(new_batch, metrics)
                 if len(new_batch) == 0:
                     max_try_make_batch = self.config.trainer.max_try_make_batch

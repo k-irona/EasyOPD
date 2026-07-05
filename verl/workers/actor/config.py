@@ -140,6 +140,10 @@ class ActorConfig:
     """drop OPSD rollout samples with invalid response format: `none`, `r1v`, or `math`"""
     opsd_format_filter_refill: bool = True
     """keep generating after OPSD format filtering until rollout_batch_size valid samples are collected"""
+    opsd_format_pg: str = "none"
+    """add an OPSD format-only policy-gradient loss: `none`, `r1v`, or `math`"""
+    opsd_format_pg_loss_coef: float = 0.0
+    """coefficient for the OPSD format-only policy-gradient loss"""
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
