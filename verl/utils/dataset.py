@@ -106,8 +106,10 @@ class RLHFDataset(Dataset):
         image_dir: Optional[str] = None,
         video_fps: float = 2.0,
         max_prompt_length: int = 1024,
+        max_teacher_prompt_length: Optional[int] = None,
         truncation: str = "error",
         format_prompt: Optional[str] = None,
+        build_opd_teacher: bool = False,
         min_pixels: Optional[int] = None,
         max_pixels: Optional[int] = None,
         filter_overlong_prompts: bool = True,
@@ -122,7 +124,9 @@ class RLHFDataset(Dataset):
         self.image_dir = image_dir
         self.video_fps = video_fps
         self.max_prompt_length = max_prompt_length
+        self.max_teacher_prompt_length = max_teacher_prompt_length or max_prompt_length
         self.truncation = truncation
+        self.build_opd_teacher = build_opd_teacher
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
 
@@ -184,6 +188,71 @@ class RLHFDataset(Dataset):
         else:
             return [{"role": "user", "content": prompt_str}]
 
+    def _build_opd_teacher_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
+        prompt_str: str = example[self.prompt_key]
+        if self.format_prompt:
+            format_prompt = Template(self.format_prompt.strip())
+            prompt_str = format_prompt.render(content=prompt_str)
+
+        privileged_prefix = (
+            "Verified answer:\n"
+            f"{example[self.answer_key]}\n\n"
+            "Use the verified answer as privileged context when evaluating the response.\n\n"
+            "Problem:\n"
+        )
+
+        if self.image_key in example:
+            content_list = []
+            for i, content in enumerate(prompt_str.split("<image>")):
+                if i == 0:
+                    content_list.append({"type": "text", "text": privileged_prefix})
+
+                if i != 0:
+                    content_list.append({"type": "image"})
+
+                if content:
+                    content_list.append({"type": "text", "text": content})
+
+            return [{"role": "user", "content": content_list}]
+        elif self.video_key in example:
+            content_list = []
+            for i, content in enumerate(prompt_str.split("<video>")):
+                if i == 0:
+                    content_list.append({"type": "text", "text": privileged_prefix})
+
+                if i != 0:
+                    content_list.append({"type": "video"})
+
+                if content:
+                    content_list.append({"type": "text", "text": content})
+
+            return [{"role": "user", "content": content_list}]
+        else:
+            return [{"role": "user", "content": privileged_prefix + prompt_str}]
+
+    def _build_position_ids(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, model_inputs: dict[str, Any]
+    ) -> torch.Tensor:
+        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+            # qwen-vl mrope
+            if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                from ..models.transformers.qwen3_vl import get_rope_index
+            else:
+                from ..models.transformers.qwen2_vl import get_rope_index
+
+            vision_position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids,
+                image_grid_thw=model_inputs.get("image_grid_thw", None),
+                video_grid_thw=model_inputs.get("video_grid_thw", None),
+                second_per_grid_ts=model_inputs.get("second_per_grid_ts", None),
+                attention_mask=attention_mask,
+            )  # (3, seq_length)
+            text_position_ids = torch.arange(len(input_ids)).unsqueeze(0)  # (1, seq_length)
+            return torch.cat((text_position_ids, vision_position_ids), dim=0)  # (4, seq_length)
+
+        return torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)  # (seq_length,)
+
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
         messages = self._build_messages(example)
         if self.image_key in example:
@@ -197,7 +266,18 @@ class RLHFDataset(Dataset):
                 processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
 
             model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
-            return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+            prompt_ok = model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+            if not prompt_ok or not self.build_opd_teacher:
+                return prompt_ok
+
+            teacher_messages = self._build_opd_teacher_messages(example)
+            teacher_prompt = self.processor.apply_chat_template(
+                teacher_messages, add_generation_prompt=True, tokenize=False
+            )
+            teacher_model_inputs = self.processor(
+                processed_images, [teacher_prompt], add_special_tokens=False, return_tensors="pt"
+            )
+            return teacher_model_inputs["input_ids"].size(-1) <= self.max_teacher_prompt_length
         elif self.video_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             videos = example[self.video_key]
@@ -211,16 +291,34 @@ class RLHFDataset(Dataset):
             model_inputs = self.processor(
                 videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt"
             )
-            return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+            prompt_ok = model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+            if not prompt_ok or not self.build_opd_teacher:
+                return prompt_ok
+
+            teacher_messages = self._build_opd_teacher_messages(example)
+            teacher_prompt = self.processor.apply_chat_template(
+                teacher_messages, add_generation_prompt=True, tokenize=False
+            )
+            teacher_model_inputs = self.processor(
+                videos=processed_videos, text=[teacher_prompt], add_special_tokens=False, return_tensors="pt"
+            )
+            return teacher_model_inputs["input_ids"].size(-1) <= self.max_teacher_prompt_length
         else:
             input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-            return len(input_ids) <= self.max_prompt_length
+            prompt_ok = len(input_ids) <= self.max_prompt_length
+            if not prompt_ok or not self.build_opd_teacher:
+                return prompt_ok
+
+            teacher_messages = self._build_opd_teacher_messages(example)
+            teacher_input_ids = self.tokenizer.apply_chat_template(teacher_messages, add_generation_prompt=True)
+            return len(teacher_input_ids) <= self.max_teacher_prompt_length
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
         example: dict = self.dataset[index]
+        raw_example = dict(example)
         messages = self._build_messages(example)
         example.pop(self.prompt_key, None)
 
@@ -238,6 +336,20 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
             example["multi_modal_data"] = {"images": images}
+
+            if self.build_opd_teacher:
+                teacher_messages = self._build_opd_teacher_messages(raw_example)
+                teacher_prompt = self.processor.apply_chat_template(
+                    teacher_messages, add_generation_prompt=True, tokenize=False
+                )
+                teacher_model_inputs = self.processor(
+                    processed_images, [teacher_prompt], add_special_tokens=False, return_tensors="pt"
+                )
+                teacher_input_ids = teacher_model_inputs.pop("input_ids")[0]
+                teacher_attention_mask = teacher_model_inputs.pop("attention_mask")[0]
+                teacher_position_ids = self._build_position_ids(
+                    teacher_input_ids, teacher_attention_mask, teacher_model_inputs
+                )
         elif self.video_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             videos = example.pop(self.video_key)
@@ -262,31 +374,46 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
             example["multi_modal_data"] = {"videos": videos}
+
+            if self.build_opd_teacher:
+                teacher_messages = self._build_opd_teacher_messages(raw_example)
+                teacher_prompt = self.processor.apply_chat_template(
+                    teacher_messages, add_generation_prompt=True, tokenize=False
+                )
+                teacher_model_inputs = self.processor(
+                    videos=processed_videos, text=[teacher_prompt], add_special_tokens=False, return_tensors="pt"
+                )
+                if "second_per_grid_ts" in self.processor.model_input_names:
+                    teacher_model_inputs["second_per_grid_ts"] = [
+                        2.0 / video_sample_fps for video_sample_fps in video_fps_list
+                    ]
+
+                teacher_input_ids = teacher_model_inputs.pop("input_ids")[0]
+                teacher_attention_mask = teacher_model_inputs.pop("attention_mask")[0]
+                teacher_position_ids = self._build_position_ids(
+                    teacher_input_ids, teacher_attention_mask, teacher_model_inputs
+                )
         else:
             prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
 
-        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            # qwen-vl mrope
-            if "Qwen3VLProcessor" in self.processor.__class__.__name__:
-                from ..models.transformers.qwen3_vl import get_rope_index
-            else:
-                from ..models.transformers.qwen2_vl import get_rope_index
+            if self.build_opd_teacher:
+                teacher_messages = self._build_opd_teacher_messages(raw_example)
+                teacher_prompt = self.tokenizer.apply_chat_template(
+                    teacher_messages, add_generation_prompt=True, tokenize=False
+                )
+                teacher_model_inputs = self.tokenizer(
+                    [teacher_prompt], add_special_tokens=False, return_tensors="pt"
+                )
+                teacher_input_ids = teacher_model_inputs.pop("input_ids")[0]
+                teacher_attention_mask = teacher_model_inputs.pop("attention_mask")[0]
+                teacher_position_ids = self._build_position_ids(
+                    teacher_input_ids, teacher_attention_mask, teacher_model_inputs
+                )
 
-            vision_position_ids = get_rope_index(
-                self.processor,
-                input_ids=input_ids,
-                image_grid_thw=model_inputs.get("image_grid_thw", None),
-                video_grid_thw=model_inputs.get("video_grid_thw", None),
-                second_per_grid_ts=model_inputs.get("second_per_grid_ts", None),
-                attention_mask=attention_mask,
-            )  # (3, seq_length)
-            text_position_ids = torch.arange(len(input_ids)).unsqueeze(0)  # (1, seq_length)
-            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)  # (4, seq_length)
-        else:
-            position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)  # (seq_length,)
+        position_ids = self._build_position_ids(input_ids, attention_mask, model_inputs)
 
         input_ids, attention_mask, position_ids = VF.postprocess_data(
             input_ids=input_ids,
@@ -310,5 +437,19 @@ class RLHFDataset(Dataset):
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
+        if self.build_opd_teacher:
+            teacher_input_ids, teacher_attention_mask, teacher_position_ids = VF.postprocess_data(
+                input_ids=teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+                position_ids=teacher_position_ids,
+                max_length=self.max_teacher_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.truncation,
+            )
+            example["teacher_prompts"] = teacher_input_ids
+            example["teacher_attention_mask"] = teacher_attention_mask
+            example["teacher_position_ids"] = teacher_position_ids
+
         example["ground_truth"] = example.pop(self.answer_key)
         return example

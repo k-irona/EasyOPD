@@ -154,6 +154,30 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def _build_opd_teacher_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        teacher_prompts = micro_batch["teacher_prompts"]
+        teacher_attention_mask = micro_batch["teacher_attention_mask"]
+        teacher_position_ids = micro_batch["teacher_position_ids"]
+        responses = micro_batch["responses"]
+        response_mask = micro_batch["response_mask"]
+        batch_size, response_length = responses.shape
+
+        delta_position_id = torch.arange(
+            1, response_length + 1, device=teacher_position_ids.device, dtype=teacher_position_ids.dtype
+        )
+        delta_position_id = delta_position_id.view(1, -1).expand(batch_size, -1)
+        if teacher_position_ids.ndim == 3:  # qwen2vl mrope: (batch_size, 4, seq_length)
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(
+                batch_size, teacher_position_ids.size(1), -1
+            )
+
+        teacher_response_position_ids = teacher_position_ids[..., -1:] + delta_position_id
+        teacher_batch = dict(micro_batch)
+        teacher_batch["input_ids"] = torch.cat([teacher_prompts, responses], dim=-1)
+        teacher_batch["attention_mask"] = torch.cat([teacher_attention_mask, response_mask], dim=-1)
+        teacher_batch["position_ids"] = torch.cat([teacher_position_ids, teacher_response_position_ids], dim=-1)
+        return teacher_batch
+
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(self.config.max_grad_norm)
@@ -207,6 +231,46 @@ class DataParallelPPOActor(BasePPOActor):
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+            log_probs_lst.append(log_probs)
+
+        log_probs = torch.concat(log_probs_lst, dim=0)
+
+        if self.config.dynamic_batching:
+            log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+
+        return log_probs
+
+    @torch.no_grad()
+    def compute_opd_teacher_log_prob(self, data: DataProto) -> torch.Tensor:
+        """Compute teacher log probabilities on sampled response tokens for OPD advantages."""
+        self.actor_module.eval()
+
+        temperature = data.meta_info["temperature"]
+        select_keys = [
+            "teacher_prompts",
+            "teacher_attention_mask",
+            "teacher_position_ids",
+            "responses",
+            "response_mask",
+        ]
+        non_tensor_select_keys = ["multi_modal_inputs"]
+
+        data = data.select(select_keys, non_tensor_select_keys)
+        if self.config.dynamic_batching:
+            max_input_len = data.batch["teacher_prompts"].size(-1) + data.batch["responses"].size(-1)
+            max_token_len = self.config.micro_batch_size_per_device_for_experience * max_input_len
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(self.config.micro_batch_size_per_device_for_experience)
+
+        log_probs_lst = []
+        if self.rank == 0:
+            micro_batches = tqdm(micro_batches, desc="Compute OPD teacher log probs", position=1)
+
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            teacher_inputs = self._build_opd_teacher_micro_batch(model_inputs)
+            log_probs = self._forward_micro_batch(teacher_inputs, temperature=temperature)
             log_probs_lst.append(log_probs)
 
         log_probs = torch.concat(log_probs_lst, dim=0)

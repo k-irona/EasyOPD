@@ -611,6 +611,11 @@ class RayPPOTrainer:
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
 
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.OPD:
+                    with timer("teacher", timing_raw):
+                        teacher_log_probs = self.actor_rollout_ref_wg.compute_opd_teacher_log_probs(batch)
+                        batch = batch.union(teacher_log_probs)
+
                 # compute ref_log_probs
                 if self.use_reference_policy:
                     with timer("ref", timing_raw):
@@ -639,13 +644,27 @@ class RayPPOTrainer:
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.OPD:
+                        advantages = (batch.batch["teacher_log_probs"] - batch.batch["old_log_probs"]).detach()
+                        advantages = advantages * batch.batch["response_mask"]
+                        batch.batch["advantages"] = advantages
+                        batch.batch["returns"] = advantages
+                        valid_advantages = torch.masked_select(advantages, batch.batch["response_mask"].bool())
+                        metrics.update(
+                            {
+                                "opd/advantage_mean": valid_advantages.mean().item(),
+                                "opd/advantage_max": valid_advantages.max().item(),
+                                "opd/advantage_min": valid_advantages.min().item(),
+                            }
+                        )
+                    else:
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
 
                 # update critic
                 if self.use_critic:

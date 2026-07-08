@@ -43,6 +43,8 @@ class DataConfig:
     image_dir: Optional[str] = None
     video_fps: float = 2.0
     max_prompt_length: int = 512
+    max_teacher_prompt_length: Optional[int] = None
+    build_opd_teacher: bool = False
     max_response_length: int = 512
     rollout_batch_size: int = 512
     mini_rollout_batch_size: Optional[int] = None
@@ -69,7 +71,7 @@ class AlgorithmConfig:
     lam: float = 1.0
     """lambda value for ppo gae advantage estimator"""
     adv_estimator: str = "grpo"
-    """advantage estimator, support `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`"""
+    """advantage estimator, support `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`, `opd`"""
     disable_kl: bool = False
     """disable reference model"""
     use_kl_loss: bool = False
@@ -160,6 +162,8 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
+        if self.algorithm.adv_estimator == "opd":
+            self.data.build_opd_teacher = True
 
     def deep_post_init(self):
         recursive_post_init(self)
