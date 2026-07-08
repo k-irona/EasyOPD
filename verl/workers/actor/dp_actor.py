@@ -256,6 +256,9 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         data = data.select(select_keys, non_tensor_select_keys)
+        data.batch["attention_mask"] = torch.cat(
+            [data.batch["teacher_attention_mask"], data.batch["response_mask"]], dim=-1
+        )
         if self.config.dynamic_batching:
             max_input_len = data.batch["teacher_prompts"].size(-1) + data.batch["responses"].size(-1)
             max_token_len = self.config.micro_batch_size_per_device_for_experience * max_input_len
