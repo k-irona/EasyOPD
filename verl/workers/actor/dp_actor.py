@@ -283,6 +283,7 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
 
         metrics = defaultdict(list)
+        policy_update_steps = 0
         for _ in range(self.config.ppo_epochs):
             if self.rank == 0:
                 mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=1)
@@ -382,6 +383,16 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                policy_update_steps += 1
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
+        append_to_dict(
+            metrics,
+            {
+                "actor/policy_updates_per_global_step": policy_update_steps,
+                "actor/global_batch_size_per_device": self.config.global_batch_size_per_device,
+                "actor/ppo_epochs": self.config.ppo_epochs,
+            },
+        )
 
         return metrics
