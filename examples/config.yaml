@@ -92,7 +92,7 @@ worker:
 trainer:
   total_epochs: 15
   max_steps: null
-  project_name: easy_r1
+  project_name: EasyOPD
   experiment_name: qwen2_5_7b_math_grpo
   logger: ["file", "wandb"]
   nnodes: 1

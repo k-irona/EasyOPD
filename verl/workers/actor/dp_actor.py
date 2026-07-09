@@ -154,7 +154,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
-    def _build_opd_teacher_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _build_opsd_teacher_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         teacher_prompts = micro_batch["teacher_prompts"]
         teacher_attention_mask = micro_batch["teacher_attention_mask"]
         teacher_position_ids = micro_batch["teacher_position_ids"]
@@ -241,8 +241,8 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs
 
     @torch.no_grad()
-    def compute_opd_teacher_log_prob(self, data: DataProto) -> torch.Tensor:
-        """Compute teacher log probabilities on sampled response tokens for OPD advantages."""
+    def compute_opsd_teacher_log_prob(self, data: DataProto) -> torch.Tensor:
+        """Compute teacher log probabilities on sampled response tokens for OPSD advantages."""
         self.actor_module.eval()
 
         temperature = data.meta_info["temperature"]
@@ -268,11 +268,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         if self.rank == 0:
-            micro_batches = tqdm(micro_batches, desc="Compute OPD teacher log probs", position=1)
+            micro_batches = tqdm(micro_batches, desc="Compute OPSD teacher log probs", position=1)
 
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            teacher_inputs = self._build_opd_teacher_micro_batch(model_inputs)
+            teacher_inputs = self._build_opsd_teacher_micro_batch(model_inputs)
             log_probs = self._forward_micro_batch(teacher_inputs, temperature=temperature)
             log_probs_lst.append(log_probs)
 
@@ -282,6 +282,11 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
 
         return log_probs
+
+    @torch.no_grad()
+    def compute_opd_teacher_log_prob(self, data: DataProto) -> torch.Tensor:
+        """Deprecated alias of compute_opsd_teacher_log_prob."""
+        return self.compute_opsd_teacher_log_prob(data)
 
     def update_policy(self, data: DataProto) -> dict[str, Any]:
         self.actor_module.train()

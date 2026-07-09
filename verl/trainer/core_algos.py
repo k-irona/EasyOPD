@@ -21,7 +21,7 @@ implement PPO
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 import numpy as np
 import torch
@@ -81,13 +81,20 @@ class AdvantageEstimator(str, Enum):
     GAE = "gae"
     GRPO = "grpo"
     GRPO_PASSK = "grpo_passk"
-    OPD = "opd"
+    OPSD = "opsd"
+    OPD = "opd"  # backwards-compatible alias for early EasyOPD experiments
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REMAX = "remax"
     RLOO = "rloo"
 
 
 ADV_ESTIMATOR_MAP: dict[str, Any] = {}
+
+
+def is_opsd_adv_estimator(name: Union[AdvantageEstimator, str]) -> bool:
+    """Return whether an advantage estimator name should use OPSD logic."""
+    value = getattr(name, "value", name)
+    return value in {AdvantageEstimator.OPSD.value, AdvantageEstimator.OPD.value}
 
 
 def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:

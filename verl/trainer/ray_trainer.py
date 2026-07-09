@@ -51,6 +51,7 @@ from .core_algos import (
     compute_advantage_return,
     compute_kl,
     get_kl_controller,
+    is_opsd_adv_estimator,
 )
 from .metrics import (
     compute_data_metrics,
@@ -611,9 +612,9 @@ class RayPPOTrainer:
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
 
-                if self.config.algorithm.adv_estimator == AdvantageEstimator.OPD:
+                if is_opsd_adv_estimator(self.config.algorithm.adv_estimator):
                     with timer("teacher", timing_raw):
-                        teacher_log_probs = self.actor_rollout_ref_wg.compute_opd_teacher_log_probs(batch)
+                        teacher_log_probs = self.actor_rollout_ref_wg.compute_opsd_teacher_log_probs(batch)
                         batch = batch.union(teacher_log_probs)
 
                 # compute ref_log_probs
@@ -644,7 +645,7 @@ class RayPPOTrainer:
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.OPD:
+                    if is_opsd_adv_estimator(self.config.algorithm.adv_estimator):
                         advantages = (batch.batch["teacher_log_probs"] - batch.batch["old_log_probs"]).detach()
                         advantages = advantages * batch.batch["response_mask"]
                         batch.batch["advantages"] = advantages
@@ -652,9 +653,9 @@ class RayPPOTrainer:
                         valid_advantages = torch.masked_select(advantages, batch.batch["response_mask"].bool())
                         metrics.update(
                             {
-                                "opd/advantage_mean": valid_advantages.mean().item(),
-                                "opd/advantage_max": valid_advantages.max().item(),
-                                "opd/advantage_min": valid_advantages.min().item(),
+                                "opsd/advantage_mean": valid_advantages.mean().item(),
+                                "opsd/advantage_max": valid_advantages.max().item(),
+                                "opsd/advantage_min": valid_advantages.min().item(),
                             }
                         )
                     else:

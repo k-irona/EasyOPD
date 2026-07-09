@@ -100,7 +100,7 @@ class SwanlabLogger(Logger):
         swanlab.init(
             project=config["trainer"]["project_name"],
             experiment_name=config["trainer"]["experiment_name"],
-            config={"UPPERFRAMEWORK": "EasyR1", "FRAMEWORK": "veRL", **config},
+            config={"UPPERFRAMEWORK": "EasyOPD", "BASEFRAMEWORK": "EasyR1", "FRAMEWORK": "veRL", **config},
             logdir=swanlab_dir,
             mode=swanlab_mode,
         )

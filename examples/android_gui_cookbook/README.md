@@ -75,8 +75,8 @@ adb devices
 ### 2.2 启动训练
 
 ```bash
-# 切换到 EasyR1 根目录
-cd /path/to/EasyR1
+# 切换到 EasyOPD 根目录
+cd /path/to/EasyOPD
 
 # 运行训练脚本
 bash examples/qwen2_5_vl_3b_android_gui_grpo.sh
@@ -104,7 +104,7 @@ bash examples/qwen2_5_vl_3b_android_gui_grpo.sh
 ```bash
 # 合并模型（转换为 HuggingFace 格式）
 python3 scripts/model_merger.py \
-  --local_dir /path/to/EasyR1/checkpoints/<experiment_name>/global_step_35/actor
+  --local_dir /path/to/EasyOPD/checkpoints/<experiment_name>/global_step_35/actor
 
 # 导出目录：checkpoints/<experiment_name>/global_step_35/actor/huggingface/
 ```

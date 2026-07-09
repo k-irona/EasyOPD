@@ -1,14 +1,20 @@
-# EasyR1: An Efficient, Scalable, Multi-Modality RL Training Framework
+# EasyOPD: OPSD on top of EasyR1
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/hiyouga/EasyR1)](https://github.com/hiyouga/EasyR1/stargazers)
-[![Twitter](https://img.shields.io/twitter/follow/llamafactory_ai)](https://twitter.com/llamafactory_ai)
+[![GitHub Repo stars](https://img.shields.io/github/stars/k-irona/EasyOPD)](https://github.com/k-irona/EasyOPD/stargazers)
 [![Docker Pulls](https://img.shields.io/docker/pulls/hiyouga/verl)](https://hub.docker.com/r/hiyouga/verl/tags)
 
-### Used by [Amazon Web Services](https://aws.amazon.com/cn/blogs/china/building-llm-model-hub-based-on-llamafactory-and-easyr1/)
+EasyOPD is a lightweight fork of [EasyR1](https://github.com/hiyouga/EasyR1) for experimenting with **OPSD** in an existing GRPO-style RL training framework.
 
-This project is a clean fork of the original [veRL](https://github.com/volcengine/verl) project to support vision language models, we thank all the authors for providing such a high-performance RL training framework.
+The implementation keeps EasyR1's rollout, log-prob recomputation, reference KL, actor update, checkpointing, and logging pipeline intact. OPSD is added as a minimal policy-gradient advantage replacement:
 
-EasyR1 is efficient and scalable due to the design of **[HybirdEngine](https://arxiv.org/abs/2409.19256)** and the latest release of **[vLLM](https://github.com/vllm-project/vllm)**'s SPMD mode.
+```text
+A_t = sg[log pi_teacher(y_t | x, y_<t) - log pi_old(y_t | x, y_<t)]
+```
+
+Here `sg` means stop-gradient. The teacher-side log-ratio is treated as a fixed token-level advantage, so gradients flow through the original policy-gradient loss instead of through the teacher log-prob computation.
+
+> [!NOTE]
+> Current EasyOPD only supports OPSD through `algorithm.adv_estimator=opsd`. OPD with a separate external teacher model is not supported yet.
 
 ## Features
 
@@ -18,20 +24,28 @@ EasyR1 is efficient and scalable due to the design of **[HybirdEngine](https://a
   - DeepSeek-R1 distill models
 
 - Supported algorithms
+  - OPSD ![new](https://img.shields.io/badge/new-orange)
   - GRPO
-  - DAPO ![new](https://img.shields.io/badge/new-orange)
+  - DAPO
   - Reinforce++
   - ReMax
   - RLOO
-  - GSPO ![new](https://img.shields.io/badge/new-orange)
-  - CISPO ![new](https://img.shields.io/badge/new-orange)
+  - GSPO
+  - CISPO
+
+- OPSD changes on top of EasyR1
+  - Adds `algorithm.adv_estimator=opsd`
+  - Adds teacher-prompt construction with `data.build_opsd_teacher`
+  - Adds teacher log-prob recomputation on sampled response tokens
+  - Replaces GRPO/group-normalized reward advantages with detached teacher/student log-ratio advantages
+  - Reuses EasyR1's actor policy-gradient loss, optional reference KL, FSDP, vLLM rollout, and logger stack
 
 - Supported datasets
-  - Any text, vision-text dataset in a [specific format](#custom-dataset)
+  - Any text or vision-text dataset in the EasyR1 data format
 
 - Supported tricks
   - Padding-free training
-  - LoRA training ![new](https://img.shields.io/badge/new-orange)
+  - LoRA training
   - Resuming from the latest/best checkpoint
   - Wandb & SwanLab & Mlflow & Tensorboard tracking
 
@@ -44,16 +58,16 @@ EasyR1 is efficient and scalable due to the design of **[HybirdEngine](https://a
 - flash-attn>=2.4.3
 - vllm>=0.8.3
 
-We provide a [Dockerfile](./Dockerfile) to easily build environments.
+We provide a [Dockerfile](./Dockerfile) inherited from EasyR1 to build environments.
 
-We recommend using the [pre-built docker image](https://hub.docker.com/r/hiyouga/verl) in EasyR1.
+The EasyR1 Docker image remains a practical starting point:
 
 ```bash
 docker pull hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0
 docker run -it --ipc=host --gpus=all hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0
 ```
 
-If your environment does not support Docker, you can consider using **Apptainer**:
+If your environment does not support Docker, you can use **Apptainer**:
 
 ```bash
 apptainer pull easyr1.sif docker://hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0
@@ -64,66 +78,93 @@ Use `USE_MODELSCOPE_HUB=1` to download models from the ModelScope hub.
 
 ### Hardware Requirements
 
-\* *estimated*
+\* *estimated from EasyR1; OPSD adds teacher log-prob recomputation and may need extra memory/time.*
 
 | Method                   | Bits |  1.5B  |   3B   |   7B   |   32B   |   72B   |
 | ------------------------ | ---- | ------ | ------ | ------ | ------- | ------- |
-| GRPO Full Fine-Tuning    |  AMP | 2*24GB | 4*40GB | 8*40GB | 16*80GB | 32*80GB |
-| GRPO Full Fine-Tuning    | BF16 | 1*24GB | 1*40GB | 4*40GB |  8*80GB | 16*80GB |
-| GRPO LoRA Fine-Tuning    |  AMP | 1*12GB | 1*24GB | 2*32GB |  2*80GB |  4*80GB |
+| OPSD/GRPO Full Fine-Tuning | AMP | 2*24GB | 4*40GB | 8*40GB | 16*80GB | 32*80GB |
+| OPSD/GRPO Full Fine-Tuning | BF16 | 1*24GB | 1*40GB | 4*40GB | 8*80GB | 16*80GB |
+| OPSD/GRPO LoRA Fine-Tuning | AMP | 1*12GB | 1*24GB | 2*32GB | 2*80GB | 4*80GB |
 
 > [!NOTE]
 > Use `worker.actor.fsdp.torch_dtype=bf16` and `worker.actor.optim.strategy=adamw_bf16` to enable bf16 training.
 
-## Tutorial: Run Qwen2.5-VL GRPO on [Geometry3K](https://huggingface.co/datasets/hiyouga/geometry3k) Dataset in Just 3 Steps
-
-![image](assets/qwen2_5_vl_7b_geo.png)
+## Tutorial: Run Qwen2.5-VL OPSD on Geometry3K in 3 Steps
 
 ### Installation
 
 ```bash
-git clone https://github.com/hiyouga/EasyR1.git
-cd EasyR1
+git clone https://github.com/k-irona/EasyOPD.git
+cd EasyOPD
 pip install -e .
 ```
 
-### GRPO Full Training
+### OPSD Full Training
+
+Set your local model path and launch the example script:
 
 ```bash
-bash examples/qwen2_5_vl_7b_geo3k_grpo.sh
+export MODEL_PATH=/path/to/Qwen2.5-VL-3B-Instruct
+bash examples/qwen2_5_vl_3b_geo3k_opsd.sh
 ```
 
-### GRPO LoRA Training
+The key OPSD switch is:
 
 ```bash
-bash examples/qwen3_vl_4b_geo3k_grpo_lora.sh
+algorithm.adv_estimator=opsd
+```
+
+### GRPO Baseline
+
+To run a GRPO baseline, keep the same EasyR1 training configuration and use:
+
+```bash
+algorithm.adv_estimator=grpo
 ```
 
 ### Merge Checkpoint in Hugging Face Format
 
 ```bash
-python3 scripts/model_merger.py --local_dir checkpoints/easy_r1/exp_name/global_step_1/actor
+python3 scripts/model_merger.py --local_dir checkpoints/EasyOPD/exp_name/global_step_1/actor
 ```
 
 > [!TIP]
 > If you encounter issues with connecting to Hugging Face, consider using `export HF_ENDPOINT=https://hf-mirror.com`.
->
-> If you want to use SwanLab logger, consider using `bash examples/qwen2_5_vl_7b_geo3k_swanlab.sh`.
+
+## OPSD Metrics
+
+For OPSD, reward is still logged by the inherited EasyR1 pipeline, but reward is not the optimization target. The most relevant training curves are:
+
+- `actor/pg_loss`: policy-gradient objective using OPSD advantages
+- `actor/kl_loss`: reference KL loss when `algorithm.use_kl_loss=true`
+- `actor/grad_norm`: update stability
+- `opsd/advantage_mean`, `opsd/advantage_max`, `opsd/advantage_min`: teacher/student log-ratio scale
+
+The actor loss follows the original EasyR1 actor update path:
+
+```text
+actor_loss = actor/pg_loss + algorithm.kl_coef * actor/kl_loss
+```
 
 ## Custom Dataset
 
-Please refer to the example datasets to prepare your own dataset.
+Please refer to the EasyR1 example datasets to prepare your own dataset.
 
 - Text dataset: https://huggingface.co/datasets/hiyouga/math12k
 - Image-text dataset: https://huggingface.co/datasets/hiyouga/geometry3k
 - Multi-image-text dataset: https://huggingface.co/datasets/hiyouga/journeybench-multi-image-vqa
 - Text-image mixed dataset: https://huggingface.co/datasets/hiyouga/rl-mixed-dataset
 
-## How to Understand GRPO in EasyR1
+For OPSD, each training sample must provide the normal prompt fields and an answer field. EasyOPD uses the answer to build a privileged teacher prompt for teacher log-prob scoring.
 
-![image](assets/easyr1_grpo.png)
+## How to Understand EasyOPD
 
-- To learn about the GRPO algorithm, you can refer to [Hugging Face's blog](https://huggingface.co/docs/trl/v0.16.1/en/grpo_trainer).
+EasyOPD inherits EasyR1's GRPO/PPO-style actor update and changes the advantage source for OPSD.
+
+- EasyR1 GRPO: group-normalized reward advantage
+- EasyOPD OPSD: detached token-level teacher/student log-ratio advantage
+
+The implementation is intentionally close to "a one-line change on top of RL implementations": it swaps the advantage tensor while keeping the policy-gradient training path.
 
 ## How to Run 70B+ Model in Multi-node Environment
 
@@ -145,78 +186,33 @@ ray start --address=<head_node_ip>:6379
 ray status
 ```
 
-4. Run training script on the Ray head node only.
+4. Run the training script on the Ray head node only.
 
 ```bash
-bash examples/qwen2_5_vl_7b_geo3k_grpo.sh
+bash examples/qwen2_5_vl_3b_geo3k_opsd.sh
 ```
 
-See the **[veRL's official doc](https://verl.readthedocs.io/en/latest/start/multinode.html)** for more details about multi-node training and Ray debugger.
-
-## Other Baselines
-
-We also reproduced the following two baselines of the [R1-V](https://github.com/deep-agent/R1-V) project.
-- [CLEVR-70k-Counting](examples/baselines/qwen2_5_vl_3b_clevr.sh): Train the Qwen2.5-VL-3B-Instruct model on counting problem.
-- [GeoQA-8k](examples/baselines/qwen2_5_vl_3b_geoqa8k.sh): Train the Qwen2.5-VL-3B-Instruct model on GeoQA problem.
-
-## Performance Baselines
-
-See [baselines.md](assets/baselines.md).
-
-## Awesome Work using EasyR1
-
-- **MMR1**: Enhancing Multimodal Reasoning with Variance-Aware Sampling and Open Resources. [![[code]](https://img.shields.io/github/stars/LengSicong/MMR1)](https://github.com/LengSicong/MMR1) [![[arxiv]](https://img.shields.io/badge/arxiv-2509.21268-blue)](https://arxiv.org/abs/2509.21268)
-- **Vision-R1**: Incentivizing Reasoning Capability in Multimodal Large Language Models. [![[code]](https://img.shields.io/github/stars/Osilly/Vision-R1)](https://github.com/Osilly/Vision-R1) [![[arxiv]](https://img.shields.io/badge/arxiv-2503.06749-blue)](https://arxiv.org/abs/2503.06749)
-- **Seg-Zero**: Reasoning-Chain Guided Segmentation via Cognitive Reinforcement. [![[code]](https://img.shields.io/github/stars/dvlab-research/Seg-Zero)](https://github.com/dvlab-research/Seg-Zero) [![[arxiv]](https://img.shields.io/badge/arxiv-2503.06520-blue)](https://arxiv.org/abs/2503.06520)
-- **MetaSpatial**: Reinforcing 3D Spatial Reasoning in VLMs for the Metaverse. [![[code]](https://img.shields.io/github/stars/PzySeere/MetaSpatial)](https://github.com/PzySeere/MetaSpatial) [![[arxiv]](https://img.shields.io/badge/arxiv-2503.18470-blue)](https://arxiv.org/abs/2503.18470)
-- **Temporal-R1**: Envolving Temporal Reasoning Capability into LMMs via Temporal Consistent Reward. [![[code]](https://img.shields.io/github/stars/appletea233/Temporal-R1)](https://github.com/appletea233/Temporal-R1) [![[arxiv]](https://img.shields.io/badge/arxiv-2506.01908-blue)](https://arxiv.org/abs/2506.01908)
-- **NoisyRollout**: Reinforcing Visual Reasoning with Data Augmentation. [![[code]](https://img.shields.io/github/stars/John-AI-Lab/NoisyRollout)](https://github.com/John-AI-Lab/NoisyRollout) [![[arxiv]](https://img.shields.io/badge/arxiv-2504.13055-blue)](https://arxiv.org/pdf/2504.13055)
-- **GUI-R1**: A Generalist R1-Style Vision-Language Action Model For GUI Agents. [![[code]](https://img.shields.io/github/stars/ritzz-ai/GUI-R1)](https://github.com/ritzz-ai/GUI-R1) [![[arxiv]](https://img.shields.io/badge/arxiv-2504.10458-blue)](https://arxiv.org/abs/2504.10458)
-- **FAST-GRPO**: Fast-Slow Thinking framework that dynamically adapts reasoning depth based on question characteristics. [![[code]](https://img.shields.io/github/stars/Mr-Loevan/FAST)](https://github.com/Mr-Loevan/FAST) [![[arxiv]](https://img.shields.io/badge/arxiv-2504.18458-blue)](https://arxiv.org/abs/2504.18458)
-- **R1-Track**: Direct Application of MLLMs to Visual Object Tracking via Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/Wangbiao2/R1-Track)](https://github.com/Wangbiao2/R1-Track)
-- **VisionReasoner**: Unified Visual Perception and Reasoning via Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/dvlab-research/VisionReasoner)](https://github.com/dvlab-research/VisionReasoner) [![[arxiv]](https://img.shields.io/badge/arxiv-2505.12081-blue)](https://arxiv.org/abs/2505.12081)
-- **MM-UPT**: Unsupervised Post-Training for Multi-Modal LLM Reasoning via GRPO. [![[code]](https://img.shields.io/github/stars/waltonfuture/MM-UPT)](https://github.com/waltonfuture/MM-UPT) [![[arxiv]](https://img.shields.io/badge/arxiv-2505.22453-blue)](https://arxiv.org/pdf/2505.22453)
-- **RL-with-Cold-Start**: Advancing Multimodal Reasoning via Reinforcement Learning with Cold Start. [![[code]](https://img.shields.io/github/stars/waltonfuture/RL-with-Cold-Start)](https://github.com/waltonfuture/RL-with-Cold-Start) [![[arxiv]](https://img.shields.io/badge/arxiv-2505.22334-blue)](https://arxiv.org/pdf/2505.22334)
-- **ViGoRL**: Grounded Reinforcement Learning for Visual Reasoning. [![[code]](https://img.shields.io/github/stars/Gabesarch/grounded-rl)](https://github.com/Gabesarch/grounded-rl) [![[arxiv]](https://img.shields.io/badge/arxiv-2505.22334-blue)](https://arxiv.org/abs/2505.23678)
-- **Revisual-R1**: Advancing Multimodal Reasoning: From Optimized Cold Start to Staged Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/CSfufu/Revisual-R1)](https://github.com/CSfufu/Revisual-R1) [![[arxiv]](https://img.shields.io/badge/arxiv-2506.04207-blue)](https://arxiv.org/abs/2506.04207)
-- **SophiaVL-R1**: Reinforcing MLLMs Reasoning with Thinking Reward. [![[code]](https://img.shields.io/github/stars/kxfan2002/SophiaVL-R1)](https://github.com/kxfan2002/SophiaVL-R1) [![[arxiv]](https://img.shields.io/badge/arxiv-2505.17018-blue)](https://arxiv.org/abs/2505.17018)
-- **Vision-Matters**: Simple Visual Perturbations Can Boost Multimodal Math Reasoning. [![[code]](https://img.shields.io/github/stars/YutingLi0606/Vision-Matters)](https://github.com/YutingLi0606/Vision-Matters) [![[arxiv]](https://img.shields.io/badge/arxiv-2506.09736-blue)](https://arxiv.org/abs/2506.09736)
-- **VTool-R1**: VLMs Learn to Think with Images via Reinforcement Learning on Multimodal Tool Use. [![[code]](https://img.shields.io/github/stars/VTOOL-R1/vtool-r1)](https://github.com/VTOOL-R1/vtool-r1) [![[arxiv]](https://img.shields.io/badge/arxiv-2505.19255-blue)](https://arxiv.org/abs/2505.19255)
-- **Long-RL**: Scaling RL to Long Sequences. [![[code]](https://img.shields.io/github/stars/NVlabs/Long-RL)](https://github.com/NVlabs/Long-RL) [![[arxiv]](https://img.shields.io/badge/arxiv-2507.07966-blue)](https://arxiv.org/abs/2507.07966)
-- **EditGRPO**: Reinforcement Learning with Post-Rollout Edits for Clinically Accurate Chest X-Ray Report Generation. [![[code]](https://img.shields.io/github/stars/taokz/EditGRPO)](https://github.com/taokz/EditGRPO)
-- **ARES**: Multimodal Adaptive Reasoning via Difficulty-Aware Token-Level Entropy Shaping. [![[code]](https://img.shields.io/github/stars/shawn0728/ARES)](https://github.com/shawn0728/ARES) [![[arxiv]](https://img.shields.io/badge/arxiv-2510.08457-blue)](https://arxiv.org/abs/2510.08457)
-- **VPPO**: Spotlight on Token Perception for Multimodal Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/huaixuheqing/VPPO-RL)](https://github.com/huaixuheqing/VPPO-RL) [![[arxiv]](https://img.shields.io/badge/arxiv-2510.09285-blue)](https://arxiv.org/abs/2510.09285)
-- **IE-Critic-R1**: Advancing the Explanatory Measurement of Text-Driven Image Editing for Human Perception Alignment. [![[code]](https://img.shields.io/github/stars/Coobiw/IE-Critic-R1)](https://github.com/Coobiw/IE-Critic-R1) [![[arxiv]](https://img.shields.io/badge/arxiv-2511.18055-blue)](https://arxiv.org/abs/2511.18055)
-- **OneThinker**: All-in-one Reasoning Model for Image and Video. [![[code]](https://img.shields.io/github/stars/tulerfeng/OneThinker)](https://github.com/tulerfeng/OneThinker) [![[arxiv]](https://img.shields.io/badge/arxiv-2512.03043-blue)](https://arxiv.org/abs/2512.03043)
-- **MetaphorStar**: Image Metaphor Understanding and Reasoning with End-to-End Visual Reinforcement Learning. [![[code]](https://img.shields.io/github/stars/MING-ZCH/MetaphorStar)](https://github.com/MING-ZCH/MetaphorStar) [![[arxiv]](https://img.shields.io/badge/arxiv-2602.10575-blue)](https://arxiv.org/abs/2602.10575)
+See the [veRL multi-node documentation](https://verl.readthedocs.io/en/latest/start/multinode.html) for more details about multi-node training and Ray debugger.
 
 ## TODO
 
-- Support ulysses parallelism for VLMs (middle priority).
+- Support external teacher models for OPD-style training.
 - Support more VLM architectures.
-
-> [!NOTE]
-> We will not provide scripts for supervised fine-tuning and inference in this project. If you have such requirements, we recommend using [LlamaFactory](https://github.com/hiyouga/LlamaFactory).
-
-### Known bugs
-
-These features are temporarily disabled for now, we plan to fix them one-by-one in the future updates.
-
-- Vision language models are not compatible with ulysses parallelism yet.
-
-## Discussion Group
-
-👋 Join our [WeChat group](https://github.com/hiyouga/llamafactory-community/blob/main/wechat/easyr1.jpg).
+- Support ulysses parallelism for VLMs.
 
 ## FAQs
 
 > ValueError: Image features and image tokens do not match: tokens: 8192, features 9800
 
-Increase the `data.max_prompt_length` or reduce the `data.max_pixels`.
+Increase `data.max_prompt_length` or reduce `data.max_pixels`.
 
 > RuntimeError: CUDA Error: out of memory at /workspace/csrc/cumem_allocator.cpp:62
 
-Reduce the `worker.rollout.gpu_memory_utilization` and enable `worker.actor.offload.offload_params`.
+Reduce `worker.rollout.gpu_memory_utilization` and enable `worker.actor.offload.offload_params`.
+
+> ValueError: No available memory for the cache blocks.
+
+Reduce `worker.rollout.gpu_memory_utilization`, use fewer concurrent processes on the same GPU, or reduce rollout/model memory usage.
 
 > RuntimeError: 0 active drivers ([]). There should only be one.
 
@@ -224,9 +220,7 @@ Uninstall `deepspeed` from the current python environment.
 
 ## Citation
 
-Core contributors: [Yaowei Zheng](https://github.com/hiyouga), [Junting Lu](https://github.com/AL-377), [Shenzhi Wang](https://github.com/Shenzhi-Wang), [Zhangchi Feng](https://github.com/BUAADreamer), [Dongdong Kuang](https://github.com/Kuangdd01), Yuwen Xiong and Richong Zhang
-
-We also thank Guangming Sheng and Chi Zhang for helpful discussions.
+EasyOPD is built on EasyR1 and veRL. Please cite and credit the upstream projects when using this repository.
 
 ```bibtex
 @misc{zheng2025easyr1,
@@ -236,8 +230,6 @@ We also thank Guangming Sheng and Chi Zhang for helpful discussions.
   year         = {2025}
 }
 ```
-
-We recommend to also cite the original work.
 
 ```bibtex
 @article{sheng2024hybridflow,

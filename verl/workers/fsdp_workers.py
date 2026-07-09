@@ -662,7 +662,7 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_opd_teacher_log_probs(self, data: DataProto):
+    def compute_opsd_teacher_log_probs(self, data: DataProto):
         assert self._has_actor
 
         self._process_multi_modal_inputs(data)
@@ -674,7 +674,7 @@ class FSDPWorker(Worker):
         data.meta_info["temperature"] = self.config.rollout.temperature
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_opd_teacher_log_prob(data=data)
+            output = self.actor.compute_opsd_teacher_log_prob(data=data)
             output = DataProto.from_dict(tensors={"teacher_log_probs": output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -686,6 +686,10 @@ class FSDPWorker(Worker):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_opd_teacher_log_probs(self, data: DataProto):
+        return self.compute_opsd_teacher_log_probs(data)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_probs(self, data: DataProto):

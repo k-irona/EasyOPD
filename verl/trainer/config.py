@@ -44,7 +44,9 @@ class DataConfig:
     video_fps: float = 2.0
     max_prompt_length: int = 512
     max_teacher_prompt_length: Optional[int] = None
+    build_opsd_teacher: bool = False
     build_opd_teacher: bool = False
+    """deprecated alias of build_opsd_teacher"""
     max_response_length: int = 512
     rollout_batch_size: int = 512
     mini_rollout_batch_size: Optional[int] = None
@@ -71,7 +73,7 @@ class AlgorithmConfig:
     lam: float = 1.0
     """lambda value for ppo gae advantage estimator"""
     adv_estimator: str = "grpo"
-    """advantage estimator, support `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`, `opd`"""
+    """advantage estimator, support `gae`, `grpo`, `opsd`, `reinforce_plus_plus`, `remax`, `rloo`"""
     disable_kl: bool = False
     """disable reference model"""
     use_kl_loss: bool = False
@@ -102,7 +104,7 @@ class TrainerConfig:
     """total epochs for training"""
     max_steps: Optional[int] = None
     """max steps for training, if specified, total_epochs is ignored"""
-    project_name: str = "easy_r1"
+    project_name: str = "EasyOPD"
     """project name for logger"""
     experiment_name: str = "demo"
     """experiment name for logger"""
@@ -162,7 +164,8 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
-        if self.algorithm.adv_estimator == "opd":
+        if self.algorithm.adv_estimator in {"opsd", "opd"}:
+            self.data.build_opsd_teacher = True
             self.data.build_opd_teacher = True
 
     def deep_post_init(self):

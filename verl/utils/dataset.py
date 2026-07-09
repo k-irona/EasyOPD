@@ -109,6 +109,7 @@ class RLHFDataset(Dataset):
         max_teacher_prompt_length: Optional[int] = None,
         truncation: str = "error",
         format_prompt: Optional[str] = None,
+        build_opsd_teacher: bool = False,
         build_opd_teacher: bool = False,
         min_pixels: Optional[int] = None,
         max_pixels: Optional[int] = None,
@@ -126,7 +127,8 @@ class RLHFDataset(Dataset):
         self.max_prompt_length = max_prompt_length
         self.max_teacher_prompt_length = max_teacher_prompt_length or max_prompt_length
         self.truncation = truncation
-        self.build_opd_teacher = build_opd_teacher
+        self.build_opsd_teacher = build_opsd_teacher or build_opd_teacher
+        self.build_opd_teacher = self.build_opsd_teacher
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
 
@@ -188,7 +190,7 @@ class RLHFDataset(Dataset):
         else:
             return [{"role": "user", "content": prompt_str}]
 
-    def _build_opd_teacher_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_opsd_teacher_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         prompt_str: str = example[self.prompt_key]
         if self.format_prompt:
             format_prompt = Template(self.format_prompt.strip())
@@ -267,10 +269,10 @@ class RLHFDataset(Dataset):
 
             model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
             prompt_ok = model_inputs["input_ids"].size(-1) <= self.max_prompt_length
-            if not prompt_ok or not self.build_opd_teacher:
+            if not prompt_ok or not self.build_opsd_teacher:
                 return prompt_ok
 
-            teacher_messages = self._build_opd_teacher_messages(example)
+            teacher_messages = self._build_opsd_teacher_messages(example)
             teacher_prompt = self.processor.apply_chat_template(
                 teacher_messages, add_generation_prompt=True, tokenize=False
             )
@@ -292,10 +294,10 @@ class RLHFDataset(Dataset):
                 videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt"
             )
             prompt_ok = model_inputs["input_ids"].size(-1) <= self.max_prompt_length
-            if not prompt_ok or not self.build_opd_teacher:
+            if not prompt_ok or not self.build_opsd_teacher:
                 return prompt_ok
 
-            teacher_messages = self._build_opd_teacher_messages(example)
+            teacher_messages = self._build_opsd_teacher_messages(example)
             teacher_prompt = self.processor.apply_chat_template(
                 teacher_messages, add_generation_prompt=True, tokenize=False
             )
@@ -306,10 +308,10 @@ class RLHFDataset(Dataset):
         else:
             input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             prompt_ok = len(input_ids) <= self.max_prompt_length
-            if not prompt_ok or not self.build_opd_teacher:
+            if not prompt_ok or not self.build_opsd_teacher:
                 return prompt_ok
 
-            teacher_messages = self._build_opd_teacher_messages(example)
+            teacher_messages = self._build_opsd_teacher_messages(example)
             teacher_input_ids = self.tokenizer.apply_chat_template(teacher_messages, add_generation_prompt=True)
             return len(teacher_input_ids) <= self.max_teacher_prompt_length
 
@@ -337,8 +339,8 @@ class RLHFDataset(Dataset):
             attention_mask = model_inputs.pop("attention_mask")[0]
             example["multi_modal_data"] = {"images": images}
 
-            if self.build_opd_teacher:
-                teacher_messages = self._build_opd_teacher_messages(raw_example)
+            if self.build_opsd_teacher:
+                teacher_messages = self._build_opsd_teacher_messages(raw_example)
                 teacher_prompt = self.processor.apply_chat_template(
                     teacher_messages, add_generation_prompt=True, tokenize=False
                 )
@@ -375,8 +377,8 @@ class RLHFDataset(Dataset):
             attention_mask = model_inputs.pop("attention_mask")[0]
             example["multi_modal_data"] = {"videos": videos}
 
-            if self.build_opd_teacher:
-                teacher_messages = self._build_opd_teacher_messages(raw_example)
+            if self.build_opsd_teacher:
+                teacher_messages = self._build_opsd_teacher_messages(raw_example)
                 teacher_prompt = self.processor.apply_chat_template(
                     teacher_messages, add_generation_prompt=True, tokenize=False
                 )
@@ -399,8 +401,8 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
 
-            if self.build_opd_teacher:
-                teacher_messages = self._build_opd_teacher_messages(raw_example)
+            if self.build_opsd_teacher:
+                teacher_messages = self._build_opsd_teacher_messages(raw_example)
                 teacher_prompt = self.tokenizer.apply_chat_template(
                     teacher_messages, add_generation_prompt=True, tokenize=False
                 )
@@ -437,7 +439,7 @@ class RLHFDataset(Dataset):
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
-        if self.build_opd_teacher:
+        if self.build_opsd_teacher:
             teacher_input_ids, teacher_attention_mask, teacher_position_ids = VF.postprocess_data(
                 input_ids=teacher_input_ids,
                 attention_mask=teacher_attention_mask,

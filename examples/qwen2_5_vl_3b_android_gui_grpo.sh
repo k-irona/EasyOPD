@@ -32,7 +32,7 @@ python3 -m verl.trainer.main \
     worker.rollout.tensor_parallel_size=1 \
     worker.reward.reward_function=examples/reward_function/android_gui.py:compute_score \
     trainer.total_epochs=3 \
-    trainer.project_name=easy_r1 \
+    trainer.project_name=EasyOPD \
     trainer.experiment_name=${EXPERIMENT_NAME} \
     trainer.logger='["console","wandb"]' \
     trainer.n_gpus_per_node=2 \
